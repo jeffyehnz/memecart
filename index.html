@@ -114,6 +114,14 @@ input.code::placeholder{color:rgba(255,238,222,.2)}
   100%{opacity:0;transform:translateY(-8px)}}
 
 /* ---------- results ---------- */
+.drow{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  padding:9px 0;border-bottom:1px solid var(--hair);font-size:12px}
+.dl{color:rgba(255,238,222,.6)}
+.dv{font-family:var(--disp);font-size:13px;letter-spacing:.05em;text-align:right}
+.dv.good{color:var(--cyan)}.dv.bad{color:var(--coral)}.dv.warn{color:var(--gold)}
+input.linkout{display:none;width:100%;font-family:var(--mono);font-size:11px;padding:9px;
+  margin-bottom:9px;background:rgba(0,0,0,.36);color:var(--cream);
+  border:1px solid var(--hair);border-radius:3px}
 #results table{width:100%;border-collapse:collapse;margin-bottom:20px;font-size:13px}
 #results th{font-size:10px;letter-spacing:.24em;text-transform:uppercase;text-align:left;
   padding-bottom:9px;color:rgba(255,238,222,.45);font-weight:400}
@@ -182,6 +190,7 @@ input.code::placeholder{color:rgba(255,238,222,.2)}
       <button class="btn" id="bHost">Host a race</button>
       <button class="btn alt" id="bJoin">Join with a code</button>
       <button class="btn alt" id="bSolo">Practice vs. the pace car</button>
+      <button class="btn alt" id="bCheck">Check my connection</button>
       <div class="keys">
         <b>W / &uarr;</b><span>Accelerate</span>
         <b>S / &darr;</b><span>Brake and reverse</span>
@@ -197,8 +206,11 @@ input.code::placeholder{color:rgba(255,238,222,.2)}
       <div class="eyebrow">Waiting room</div>
       <h1>Share<br><em>this code</em></h1>
       <div class="codebox"><div class="lbl">Race code</div><div class="val" id="myCode">·····</div></div>
-      <p class="hint">Send those five characters to your friend. They pick
-        &ldquo;Join with a code&rdquo; on this same page and type it in.</p>
+      <button class="btn" id="bCopy">Copy join link</button>
+      <input class="linkout" id="linkOut" readonly>
+      <p class="hint">Send them the link and they will join automatically &mdash; no typing.
+        Or read them the five characters. Keep this tab open and in the foreground until
+        they are in.</p>
       <div class="status" id="sHost">Opening a lobby&hellip;</div>
       <button class="btn alt" id="bBack1">Back</button>
     </div>
@@ -211,6 +223,14 @@ input.code::placeholder{color:rgba(255,238,222,.2)}
       <button class="btn" id="bGo">Connect</button>
       <div class="status" id="sJoin"></div>
       <button class="btn alt" id="bBack2">Back</button>
+    </div>
+
+    <div class="pane" id="pDiag">
+      <div class="eyebrow">Connection check</div>
+      <h1>Can you<br><em>go direct?</em></h1>
+      <div id="diagOut"></div>
+      <p class="hint" id="diagVerdict" style="margin-top:16px"></p>
+      <button class="btn alt" id="bBack3">Back</button>
     </div>
 
     <div class="pane" id="pRes">
@@ -1123,7 +1143,9 @@ function respawn(k) {
    race traffic never touches anyone's server.
    ============================================================ */
 const NS = 'sunsetcircuit-v1-';
-const ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+/* No two of these are confusable in a heavy condensed face: S/5, Z/2,
+   B/8, G/6, O/0 and I/1 are all excluded. 23^5 = 6.4M combinations. */
+const ALPHA = 'ACDEFHJKMNPRTUVWXY34679';
 const NET_DELAY = 0.10;   // render remote kart this far in the past
 const SEND_HZ = 20;
 
@@ -1169,13 +1191,24 @@ function tryHost(attempt) {
     $('myCode').textContent = code;
     setStatus('sHost', 'Lobby open. Waiting for your friend to join\u2026');
   });
+  /* The signalling socket can drop while you are off texting the code,
+     which quietly deregisters the lobby. Reclaim it. */
+  p.on('disconnected', () => {
+    if (net.connected) return;
+    setStatus('sHost', 'Lobby dropped off the server \u2014 reclaiming\u2026', true);
+    try { p.reconnect(); } catch (e) {}
+    setTimeout(() => {
+      if (!net.connected && net.peer === p && !p.disconnected)
+        setStatus('sHost', 'Lobby open again. Waiting for your friend\u2026');
+    }, 1500);
+  });
   p.on('error', e => {
     if (e && e.type === 'unavailable-id') { try { p.destroy(); } catch (x) {} tryHost(attempt + 1); }
     else setStatus('sHost', netErr(e), true);
   });
   p.on('connection', c => {
     if (net.conn) { try { c.close(); } catch (x) {} return; }
-    bindConn(c);
+    bindConn(c, 'sHost');
   });
 }
 
@@ -1186,17 +1219,34 @@ function joinRace(code) {
   net.peer = p;
   p.on('open', () => {
     setStatus('sJoin', 'Opening a direct connection\u2026');
-    bindConn(p.connect(NS + code, { reliable: false }));
+    bindConn(p.connect(NS + code, { reliable: false }), 'sJoin');
     setTimeout(() => {
       if (!net.connected) setStatus('sJoin',
-        'No answer yet. Make sure they are still on the waiting screen.', true);
+        'Still no route after 14s. Either they left the waiting screen, or one of you is on a '
+        + 'network that blocks peer-to-peer. Try "Check my connection".', true);
     }, 14000);
   });
   p.on('error', e => setStatus('sJoin', netErr(e), true));
 }
 
-function bindConn(c) {
+function iceWatch(c, statusId) {
+  const pc = c && c.peerConnection;
+  if (!pc) return;
+  const tell = () => {
+    if (net.connected) return;
+    const st = pc.iceConnectionState;
+    if (st === 'checking') setStatus(statusId, 'Found them. Negotiating a direct route\u2026');
+    else if (st === 'failed') setStatus(statusId,
+      'No direct route exists between your two networks. Run "Check my connection" on both ends.', true);
+    else if (st === 'disconnected') setStatus(statusId, 'Route dropped. Retrying\u2026', true);
+  };
+  pc.addEventListener('iceconnectionstatechange', tell);
+  tell();
+}
+
+function bindConn(c, statusId) {
   net.conn = c;
+  setTimeout(() => iceWatch(c, statusId || 'sJoin'), 400);
   c.on('open', () => { net.connected = true; onPeerReady(); });
   c.on('data', onData);
   c.on('close', onPeerLost);
@@ -1558,6 +1608,10 @@ function wireUI() {
   $('bHost').onclick = () => { armAudio(); pane('pHost'); hostRace(); };
   $('bJoin').onclick = () => { armAudio(); pane('pJoin'); setStatus('sJoin', ''); $('inCode').focus(); };
   $('bSolo').onclick = () => { armAudio(); startSolo(); };
+  $('bCheck').onclick = () => { armAudio(); pane('pDiag'); runCheck(); };
+  $('bBack3').onclick = () => pane('pHome');
+  $('bCopy').onclick = copyLink;
+  document.addEventListener('pointerdown', armAudio, { once: true });
   $('bBack1').onclick = $('bBack2').onclick = () => {
     if (net.peer) { try { net.peer.destroy(); } catch (e) {} }
     net.peer = null; net.conn = null; net.connected = false;
@@ -1597,6 +1651,155 @@ function fatal(msg) {
   c.appendChild(h); c.appendChild(p);
 }
 
+
+/* ============================================================
+   CONNECTION CHECK
+   Two questions decide whether peer-to-peer can work at all:
+   can we reach a STUN server, and does our NAT give us the same
+   public port when asked by two different servers? If the port
+   changes, the NAT is symmetric (typical of CGNAT) and no amount
+   of retrying will help without a TURN relay.
+   ============================================================ */
+function parseCand(str) {
+  const f = String(str).split(' ');
+  return { addr: f[4], port: +f[5], type: f[7] };
+}
+
+function stunProbe(url, ms) {
+  return new Promise(res => {
+    let pc;
+    try { pc = new RTCPeerConnection({ iceServers: [{ urls: url }] }); }
+    catch (e) { return res({ ok: false, why: 'webrtc unavailable' }); }
+    const found = [];
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      try { pc.close(); } catch (e) {}
+      res({ ok: true, srflx: found.filter(c => c.type === 'srflx'),
+            host: found.filter(c => c.type === 'host').length });
+    };
+    pc.onicecandidate = e => {
+      if (!e.candidate) return finish();
+      found.push(parseCand(e.candidate.candidate));
+    };
+    setTimeout(finish, ms);
+    try { pc.createDataChannel('probe'); } catch (e) {}
+    pc.createOffer().then(o => pc.setLocalDescription(o))
+      .catch(() => { if (!settled) { settled = true; res({ ok: false, why: 'offer failed' }); } });
+  });
+}
+
+function sigProbe(ms) {
+  return new Promise(res => {
+    if (!PEEROK) return res({ ok: false, why: 'library not loaded' });
+    let pr;
+    try { pr = new Peer({ debug: 0 }); }
+    catch (e) { return res({ ok: false, why: 'could not start' }); }
+    const kill = () => { try { pr.destroy(); } catch (e) {} };
+    const t = setTimeout(() => { kill(); res({ ok: false, why: 'no response' }); }, ms);
+    pr.on('open', id => { clearTimeout(t); kill(); res({ ok: true, id: id }); });
+    pr.on('error', e => { clearTimeout(t); kill(); res({ ok: false, why: (e && e.type) || 'error' }); });
+  });
+}
+
+function diagRow(label) {
+  const d = document.createElement('div'); d.className = 'drow';
+  const a = document.createElement('span'); a.className = 'dl'; a.textContent = label;
+  const b = document.createElement('span'); b.className = 'dv'; b.textContent = 'checking\u2026';
+  d.appendChild(a); d.appendChild(b);
+  $('diagOut').appendChild(d);
+  return (txt, cls) => { b.textContent = txt; b.className = 'dv' + (cls ? ' ' + cls : ''); };
+}
+
+let checking = false;
+async function runCheck() {
+  if (checking) return;
+  checking = true;
+  $('diagOut').textContent = '';
+  $('diagVerdict').textContent = '';
+  const rSup = diagRow('WebRTC support');
+  const rSig = diagRow('Signalling server');
+  const rPub = diagRow('Your public address');
+  const rNat = diagRow('NAT behaviour');
+
+  if (typeof RTCPeerConnection === 'undefined') {
+    rSup('missing', 'bad');
+    rSig('\u2014'); rPub('\u2014'); rNat('\u2014');
+    $('diagVerdict').textContent = 'This browser cannot do WebRTC at all. Try Chrome, Edge, Firefox or Safari.';
+    checking = false; return;
+  }
+  rSup('present', 'good');
+
+  const sig = await sigProbe(9000);
+  rSig(sig.ok ? 'reachable' : 'unreachable (' + sig.why + ')', sig.ok ? 'good' : 'bad');
+
+  const a = await stunProbe('stun:stun.l.google.com:19302', 5000);
+  const b = await stunProbe('stun:stun1.l.google.com:19302', 5000);
+  const aS = (a.ok && a.srflx) || [], bS = (b.ok && b.srflx) || [];
+
+  let verdict;
+  if (!aS.length && !bS.length) {
+    rPub('not visible', 'bad');
+    rNat('STUN blocked', 'bad');
+    verdict = 'Your network is not letting WebRTC find your public address \u2014 usually a corporate '
+      + 'firewall, a VPN, or a proxy blocking UDP. Peer-to-peer cannot work here. Turn off any VPN, '
+      + 'or try a phone hotspot.';
+  } else {
+    rPub(aS.length ? aS[0].addr : bS[0].addr, 'good');
+    const ports = {};
+    aS.forEach(c => { ports[c.port] = 1; });
+    const stable = bS.some(c => ports[c.port]);
+    if (stable) {
+      rNat('same port from both servers', 'good');
+      verdict = 'Your side is fine \u2014 your NAT keeps a stable public port, which is what direct '
+        + 'connections need. If joining still fails, run this same check on your friend\u2019s machine.';
+    } else if (!bS.length || !aS.length) {
+      rNat('only one server answered', 'warn');
+      verdict = 'Partial result \u2014 one STUN server did not answer, so this is inconclusive. '
+        + 'Run it again. If it keeps coming back like this, treat it as a restrictive network.';
+    } else {
+      rNat('port changes per server', 'bad');
+      verdict = 'You are behind a symmetric NAT, almost certainly carrier-grade NAT \u2014 common on '
+        + 'mobile data and some fixed-line plans. Direct connections will not form without a TURN '
+        + 'relay. Try a different network on either end, or fall back to a relay server.';
+    }
+  }
+  $('diagVerdict').textContent = verdict;
+  checking = false;
+}
+
+/* ---- shareable join link ---- */
+function joinLink() {
+  return net.code ? location.href.split('#')[0] + '#' + net.code : '';
+}
+async function copyLink() {
+  const link = joinLink();
+  if (!link) { toast('No code yet'); return; }
+  try {
+    await navigator.clipboard.writeText(link);
+    toast('Link copied');
+  } catch (e) {
+    const o = $('linkOut');
+    o.value = link; o.style.display = 'block';
+    o.focus(); o.select();
+    toast('Copy it from the box');
+  }
+}
+function checkHash() {
+  const h = (location.hash || '').replace(/^#/, '').trim().toUpperCase();
+  if (h.length !== 5) return;
+  pane('pJoin');
+  $('inCode').value = h;
+  setStatus('sJoin', 'Code found in the link. Connecting\u2026');
+  const attempt = n => {
+    if (PEEROK) return joinRace(h);
+    if (n > 40) return setStatus('sJoin', 'Networking library did not load. Reload the page.', true);
+    setTimeout(() => attempt(n + 1), 250);
+  };
+  attempt(0);
+}
+
 function initMath() {
   UP = new THREE.Vector3(0, 1, 0);
   _rel = new THREE.Vector3(); _seg = new THREE.Vector3();
@@ -1634,6 +1837,8 @@ function initMath() {
     'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'
   ]).then(() => { PEEROK = true; })
     .catch(() => { PEEROK = false; });
+
+  checkHash();
 })();
 </script>
 </body>
